@@ -1,0 +1,106 @@
+
+name: Ecosystem Explorer — Sovereign Lifecycle
+
+on:
+  push:
+    branches: [main, master]
+    paths-ignore:
+      - "outputs/**"
+      - "memory/**"
+  workflow_dispatch:
+  schedule:
+    - cron: "30 */4 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ecosystem-explorer-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  run-node:
+    name: Run and verify node continuity
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout node repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Validate kernel
+        run: python -m py_compile kernel.py
+
+      - name: Run node kernel
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          REPO_OWNER: ${{ github.repository_owner }}
+          PYTHONUNBUFFERED: "1"
+        run: python kernel.py
+
+      - name: Verify persistent state and output
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          state_path = Path("synapses/state.json")
+          output_path = Path("outputs/synapse_forward.json")
+          history_path = Path("memory/events.jsonl")
+
+          for path in (state_path, output_path, history_path):
+              if not path.is_file():
+                  raise SystemExit(f"Missing required artifact: {path}")
+
+          state = json.loads(state_path.read_text(encoding="utf-8"))
+          output = json.loads(output_path.read_text(encoding="utf-8"))
+          events = [
+              line
+              for line in history_path.read_text(encoding="utf-8").splitlines()
+              if line.strip()
+          ]
+
+          if not isinstance(state.get("epoch"), int):
+              raise SystemExit("Invalid epoch in persistent state")
+
+          if not output.get("identity"):
+              raise SystemExit("Output has no node identity")
+
+          if not output.get("quantum_cid"):
+              raise SystemExit("Output has no observation fingerprint")
+
+          if not events:
+              raise SystemExit("Event history is empty")
+
+          print(f"Node: {output['identity']}")
+          print(f"Epoch: {state['epoch']}")
+          print(f"History records: {len(events)}")
+          print("Artifact validation: PASS")
+          PY
+
+      - name: Commit verified node state
+        env:
+          TARGET_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+
+          git config user.name "ecosystem-explorer"
+          git config user.email \
+            "ecosystem-explorer@users.noreply.github.com"
+
+          git add synapses/state.json outputs/ memory/
+
+          if git diff --cached --quiet; then
+            echo "No state changes to commit."
+            exit 0
+          fi
+
+          git commit -m "Record verified node lifecycle [skip ci]"
+          git push origin "HEAD:${TARGET_BRANCH}"
