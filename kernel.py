@@ -1,4 +1,3 @@
-
 import hashlib
 import json
 import os
@@ -9,12 +8,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
+
 OWNER = os.environ.get("REPO_OWNER", "100048777766367")
 IDENTITY = os.environ.get(
     "GITHUB_REPOSITORY",
     f"{OWNER}/ecosystem-explorer",
 )
 CONTRACT = "ecosystem-explorer.v1"
+API_URL = f"https://api.github.com/users/{OWNER}/repos"
 
 STATE_PATH = ROOT / "synapses" / "state.json"
 OUTPUT_PATH = ROOT / "outputs" / "synapse_forward.json"
@@ -43,10 +44,7 @@ def fetch_repositories():
     page = 1
 
     while True:
-        url = (
-            f"https://api.github.com/users/{OWNER}/repos"
-            f"?per_page=100&page={page}&type=owner"
-        )
+        url = f"{API_URL}?per_page=100&page={page}&type=owner"
         request = urllib.request.Request(
             url,
             headers={
@@ -59,7 +57,7 @@ def fetch_repositories():
             batch = json.loads(response.read().decode("utf-8"))
 
         if not isinstance(batch, list):
-            raise ValueError("GitHub API returned an invalid repository list")
+            raise ValueError("GitHub API returned an invalid response")
 
         repositories.extend(
             {
@@ -76,16 +74,20 @@ def fetch_repositories():
 
         page += 1
 
-    return sorted(repositories, key=lambda repo: repo["name"].lower())
+    return sorted(repositories, key=lambda item: item["name"].lower())
 
 
-def previous_state():
+def get_previous_state():
     state = read_json(STATE_PATH, {})
     if not isinstance(state, dict):
         state = {}
 
     epoch = state.get("epoch", 0)
-    if not isinstance(epoch, int) or isinstance(epoch, bool) or epoch < 0:
+    if (
+        not isinstance(epoch, int)
+        or isinstance(epoch, bool)
+        or epoch < 0
+    ):
         epoch = 0
 
     return state, epoch
@@ -93,43 +95,61 @@ def previous_state():
 
 def append_event(event):
     HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with HISTORY_PATH.open("a", encoding="utf-8", newline="\n") as history:
-        history.write(
-            json.dumps(event, sort_keys=True, ensure_ascii=False) + "\n"
+    with HISTORY_PATH.open("a", encoding="utf-8") as file:
+        file.write(
+            json.dumps(
+                event,
+                sort_keys=True,
+                ensure_ascii=False,
+            )
+            + "\n"
         )
 
 
 def run():
-    old_state, old_epoch = previous_state()
-    epoch = old_epoch + 1
+    previous, previous_epoch = get_previous_state()
     timestamp = datetime.now(timezone.utc).isoformat()
-
-    previous_cid = old_state.get("quantum_cid")
-    observation_error = None
-    repositories = []
+    epoch = previous_epoch + 1
 
     try:
         repositories = fetch_repositories()
         scan_status = "success"
+        error = None
     except (
         OSError,
         ValueError,
         KeyError,
         urllib.error.URLError,
-    ) as error:
+    ) as exc:
+        repositories = []
         scan_status = "failed"
-        observation_error = f"{type(error).__name__}: {error}"
+        error = f"{type(exc).__name__}: {exc}"
+
+    # A failed scan is not allowed to overwrite the last good state.
+    if scan_status == "failed":
+        event = {
+            "contract": CONTRACT,
+            "identity": IDENTITY,
+            "epoch": epoch,
+            "timestamp": timestamp,
+            "status": "observation_failed",
+            "previous_quantum_cid": previous.get("quantum_cid"),
+            "error": error,
+        }
+        append_event(event)
+        print(json.dumps(event, indent=2, ensure_ascii=False))
+        print(error, file=sys.stderr)
+        return 1
 
     observation = {
         "contract": CONTRACT,
         "identity": IDENTITY,
         "epoch": epoch,
         "timestamp": timestamp,
-        "scan_status": scan_status,
+        "status": "observed",
         "repositories_observed": len(repositories),
         "repositories": repositories,
-        "previous_quantum_cid": previous_cid,
-        "error": observation_error,
+        "previous_quantum_cid": previous.get("quantum_cid"),
     }
 
     canonical = json.dumps(
@@ -150,23 +170,18 @@ def run():
         "identity": IDENTITY,
         "epoch": epoch,
         "last_run": timestamp,
-        "scan_status": scan_status,
+        "scan_status": "success",
         "repositories_observed": len(repositories),
         "quantum_cid": cid,
-        "previous_quantum_cid": previous_cid,
     }
 
-    # Persist the observation even when the remote scan fails.
-    write_json(OUTPUT_PATH, packet)
+    # Write the event first, then publish the successful state.
     append_event(packet)
+    write_json(OUTPUT_PATH, packet)
     write_json(STATE_PATH, state)
 
     print(json.dumps(state, indent=2, ensure_ascii=False))
-
-    if scan_status != "success":
-        print(f"Observation failed: {observation_error}", file=sys.stderr)
-        return 1
-
+    print("KERNEL_STATUS=PASS")
     return 0
 
 
