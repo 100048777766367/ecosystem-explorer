@@ -1,77 +1,37 @@
-
-name: Ecosystem Explorer — Node Lifecycle
+name: Ecosystem Explorer
 
 on:
-  push:
-    branches:
-      - main
-      - master
   workflow_dispatch:
+  push:
+    branches: [main]
   schedule:
     - cron: "30 */4 * * *"
 
 permissions:
   contents: write
 
-concurrency:
-  group: ecosystem-explorer-lifecycle
-  cancel-in-progress: false
-
 jobs:
   run-node:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Check repository and kernel
-        run: |
-          set -eu
-          pwd
-          test -f kernel.py
-          python --version
-          python -m py_compile kernel.py
-
-      - name: Execute kernel
+      - name: Run kernel
         env:
           REPO_OWNER: ${{ github.repository_owner }}
           GITHUB_REPOSITORY: ${{ github.repository }}
-          PYTHONUNBUFFERED: "1"
-        run: python -u kernel.py
+        run: python kernel.py
 
-      - name: Verify generated files
+      - name: Save state
         run: |
-          set -eu
-          test -s synapses/state.json
-          test -s outputs/synapse_forward.json
-          test -s memory/events.jsonl
-          python -c "import json; json.load(open('synapses/state.json', encoding='utf-8'))"
-          python -c "import json; json.load(open('outputs/synapse_forward.json', encoding='utf-8'))"
-
-      - name: Commit node state
-        if: success()
-        env:
-          GH_TOKEN: ${{ github.token }}
-          BRANCH: ${{ github.event.repository.default_branch }}
-        run: |
-          set -eu
           git config user.name "ecosystem-explorer"
-          git config user.email \
-            "ecosystem-explorer@users.noreply.github.com"
-
+          git config user.email "ecosystem-explorer@users.noreply.github.com"
           git add synapses/state.json outputs/synapse_forward.json memory/events.jsonl
-
-          if git diff --cached --quiet; then
-            echo "No state changes."
-            exit 0
-          fi
-
-          git commit -m "Record node lifecycle state [skip ci]"
-          git push origin "HEAD:${BRANCH}"
+          git diff --cached --quiet || (
+            git commit -m "Record node state [skip ci]"
+            git push
+          )
